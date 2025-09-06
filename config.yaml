@@ -1,0 +1,47 @@
+# ShuttleSense Configuration
+
+# Paths
+paths:
+  data_dir: "data"
+  output_dir: "output"
+  models_dir: "models"
+
+# Hit Detection Model
+hit_detection:
+  # Original model for fallback
+  # model_id: "phubinhdang/videomae-base-finetuned-badminton-rally"
+  model_id: "yexter/videomae-base-Badminton_strokes-finetuned-stroke-classification"
+  confidence_threshold: 0.2
+  sample_rate: 5  # Process every N frames
+  window_size: 16  # Number of frames to analyze together
+  
+  # Enhanced model settings
+  use_enhanced_detector: true  # Use enhanced detector with action classification
+  use_custom_model: true       # Use custom trained model if available
+  custom_model_path: "models/checkpoints/action_classification/best_model"  # Path to trained model
+
+# Video Segmentation
+video_segmentation:
+  pre_hit_frames: 15  # Number of frames to include before hit point
+  post_hit_frames: 30  # Number of frames to include after hit point
+  
+# Annotation
+annotation:
+  provider: "gemini"  # Options: "gemini", "openai"
+  model: "gemini-pro-vision"  # or "gpt-4o" if using OpenAI
+  temperature: 0.2
+  max_tokens: 300
+  
+# Qwen-VL LoRA Configuration
+qwen_vl:
+  enabled: true  # Enable Qwen-VL LoRA integration
+  model_path: "models/checkpoints/qwen_vl_lora/final_model"  # Path to trained LoRA model
+  config_path: "configs/qwen_vl_lora_config.yaml"  # Path to Qwen-VL configuration
+  use_ensemble: true  # Use ensemble of VideoMAE and Qwen-VL
+  confidence_threshold: 0.8  # Confidence threshold for Qwen-VL primary decision
+
+# System
+system:
+  batch_size: 8
+  num_workers: 4
+  log_level: "INFO"

@@ -1,0 +1,40 @@
+# Core dependencies
+numpy
+pandas
+opencv-python
+torch
+torchvision
+transformers
+ffmpeg-python
+Pillow
+
+# API and services
+fastapi
+uvicorn
+flask
+python-dotenv
+requests
+
+# For Gemini or GPT-4o API access
+google-generativeai
+openai
+
+# Utilities
+tqdm
+pyyaml
+
+# YouTube video download
+yt-dlp
+
+# Training and evaluation dependencies
+scikit-learn
+matplotlib
+seaborn
+wandb  # Optional: for experiment tracking
+tensorboard  # Optional: for training visualization
+accelerate  # For distributed training
+
+tiktoken==0.11.0
+peft==0.17.1
+einops==0.8.1
+transformers-stream-generator==0.0.5

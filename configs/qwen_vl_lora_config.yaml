@@ -1,0 +1,88 @@
+# Qwen-VL LoRA Fine-tuning Configuration
+# Configuration for fine-tuning Qwen-VL using LoRA for badminton action recognition
+
+# Dataset configuration
+data:
+  dataset_path: "data/qwen_vl_dataset"
+  max_frames: 8  # Maximum frames to extract from each video
+  frame_size: [224, 224]  # Input frame size
+
+# Model configuration
+model:
+  name: "Qwen/Qwen-VL-Chat"  # Base Qwen-VL model
+
+# LoRA configuration
+qwen_vl_lora:
+  # LoRA parameters
+  lora_r: 64                    # LoRA rank
+  lora_alpha: 16                # LoRA scaling parameter
+  lora_dropout: 0.1             # LoRA dropout
+  target_modules: ["c_attn", "c_proj"]  # Target modules for LoRA (Qwen-VL specific)
+  
+  # Training parameters
+  epochs: 5                     # Number of training epochs
+  batch_size: 1                 # Batch size (small due to memory constraints)
+  gradient_accumulation_steps: 8 # Gradient accumulation steps
+  learning_rate: 1e-4           # Learning rate
+  weight_decay: 0.01            # Weight decay
+  warmup_ratio: 0.1             # Warmup ratio
+  max_length: 2048              # Maximum sequence length
+  
+  # Data loading
+  dataloader_num_workers: 2     # Number of workers for data loading
+  
+  # Output and logging
+  output_dir: "models/checkpoints/qwen_vl_lora"
+  logging_steps: 10             # Log every N steps
+  save_steps: 100               # Save every N steps
+  eval_strategy: "steps"  # Evaluation strategy
+  eval_steps: 100               # Evaluate every N steps
+  save_total_limit: 3           # Maximum number of checkpoints to keep
+  
+  # Hardware optimization
+  fp16: true                    # Use mixed precision training
+  gradient_checkpointing: true  # Enable gradient checkpointing to save memory
+  
+# Inference configuration
+inference:
+  # Generation parameters
+  max_new_tokens: 50            # Maximum tokens to generate
+  temperature: 0.3              # Sampling temperature
+  top_p: 0.8                    # Top-p sampling
+  do_sample: true               # Use sampling
+  
+  # Video processing
+  max_inference_frames: 8       # Maximum frames for inference
+  frame_sampling: "uniform"     # Frame sampling strategy: "uniform", "random"
+  
+# Action classes (Chinese names for better recognition)
+action_classes:
+  - "短发球"         # Short Serve
+  - "斜线飞行"       # Cross Court Flight
+  - "挑球"          # Lift
+  - "点杀"          # Tap Smash
+  - "挡球"          # Block
+  - "吊球"          # Drop Shot
+  - "推球"          # Push Shot
+  - "过渡切球"       # Transitional Slice
+  - "切球"          # Cut
+  - "扑球"          # Rush Shot
+  - "防守高远球"     # Defensive Clear
+  - "防守平抽"       # Defensive Drive
+  - "高远球"        # Clear
+  - "长发球"        # Long Serve
+  - "杀球"          # Smash
+  - "平射球"        # Flat Shot
+  - "后场平抽"       # Rear Court Flat Drive
+  - "短平射"        # Short Flat Shot
+
+# Question templates for training data augmentation
+question_templates:
+  - "请识别视频中的羽毛球动作是什么？"
+  - "视频中展示的是什么羽毛球技术动作？"
+  - "这个羽毛球视频片段显示的动作类型是？"
+  - "请分析这个羽毛球动作并给出名称。"
+  - "请问视频中的球员做的是什么技术动作？"
+  - "识别一下这个羽毛球动作的类型。"
+  - "这是什么羽毛球技术？"
+  - "请描述视频中的羽毛球动作名称。"
