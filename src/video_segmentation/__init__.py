@@ -1,0 +1,1 @@
+"""Video Segmentation module for ShuttleSense."""

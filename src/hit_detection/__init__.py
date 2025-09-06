@@ -1,0 +1,1 @@
+"""Hit Detection module for ShuttleSense."""
