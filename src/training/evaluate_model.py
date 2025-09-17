@@ -1,9 +1,8 @@
 """
-Model Evaluation and Testing Utilities
-Tools for evaluating trained VideoMAE models on test data
+Model Evaluation and Testing Utilities for Qwen-VL
+Tools for evaluating trained Qwen-VL models on test data
 """
 
-import os
 import json
 import torch
 import numpy as np
@@ -12,27 +11,111 @@ import seaborn as sns
 from pathlib import Path
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, classification_report, roc_auc_score, roc_curve
+    confusion_matrix, classification_report
 )
-from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
-from torch.utils.data import DataLoader
+from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+from torch.utils.data import Dataset
 import yaml
 import logging
 from tqdm import tqdm
 import cv2
+from PIL import Image
 
-from train_videomae import VideoBadmintonDataset
+class QwenVLDataset(Dataset):
+    """Dataset class for Qwen-VL evaluation"""
+    
+    def __init__(self, data_file, videos_dir, processor, tokenizer):
+        """
+        Initialize dataset
+        
+        Args:
+            data_file: Path to JSON file containing test data
+            videos_dir: Directory containing video files
+            processor: Qwen-VL processor
+            tokenizer: Qwen-VL tokenizer
+        """
+        self.videos_dir = Path(videos_dir)
+        self.processor = processor
+        self.tokenizer = tokenizer
+        
+        # Load data
+        with open(data_file, 'r', encoding='utf-8') as f:
+            self.data = json.load(f)
+        
+        # Create action class mapping
+        self.action_mapping = {
+            "短发球": 0, "斜线飞行": 1, "挑球": 2, "点杀": 3, "挡球": 4,
+            "吊球": 5, "推球": 6, "过渡切球": 7, "切球": 8, "扑球": 9,
+            "防守高远球": 10, "防守平抽": 11, "高远球": 12, "长发球": 13,
+            "杀球": 14, "平射球": 15, "后场平抽": 16, "短平射": 17
+        }
+        
+        # Reverse mapping for evaluation
+        self.id_to_action = {v: k for k, v in self.action_mapping.items()}
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # Load video
+        video_path = self.videos_dir / item['video']
+        frames = self._load_video_frames(video_path)
+        
+        # Get question and answer
+        conversation = item['conversations']
+        question = conversation[0]['value'].replace('<video>', '')
+        answer = conversation[1]['value']
+        
+        # Convert answer to class ID
+        label = self._extract_action_from_answer(answer)
+        
+        return {
+            'frames': frames,
+            'question': question,
+            'answer': answer,
+            'label': label,
+            'video_path': str(video_path)
+        }
+    
+    def _load_video_frames(self, video_path, max_frames=8):
+        """Load video frames"""
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int)
+        
+        for frame_idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if ret:
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_pil = Image.fromarray(frame_rgb)
+                frames.append(frame_pil)
+        
+        cap.release()
+        return frames
+    
+    def _extract_action_from_answer(self, answer):
+        """Extract action class from answer text"""
+        for action, class_id in self.action_mapping.items():
+            if action in answer:
+                return class_id
+        return -1  # Unknown action
 
 class ModelEvaluator:
-    """Evaluate trained VideoMAE models"""
+    """Evaluate trained Qwen-VL models"""
     
-    def __init__(self, model_path, config_path="configs/training_config.yaml"):
+    def __init__(self, model_path, config_path="config.yaml"):
         """
         Initialize evaluator
         
         Args:
             model_path: Path to trained model
-            config_path: Path to training configuration
+            config_path: Path to configuration file
         """
         self.model_path = Path(model_path)
         self.logger = logging.getLogger(__name__)
@@ -42,15 +125,28 @@ class ModelEvaluator:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
         
-        # Load model and processor
+        # Load model, tokenizer, and processor
         self._load_model()
         
+        # Action mapping for evaluation
+        self.action_mapping = {
+            "短发球": 0, "斜线飞行": 1, "挑球": 2, "点杀": 3, "挡球": 4,
+            "吊球": 5, "推球": 6, "过渡切球": 7, "切球": 8, "扑球": 9,
+            "防守高远球": 10, "防守平抽": 11, "高远球": 12, "长发球": 13,
+            "杀球": 14, "平射球": 15, "后场平抽": 16, "短平射": 17
+        }
+        self.id_to_action = {v: k for k, v in self.action_mapping.items()}
+        
     def _load_model(self):
-        """Load the trained model and processor"""
+        """Load the trained model, tokenizer, and processor"""
         try:
-            self.processor = VideoMAEImageProcessor.from_pretrained(self.model_path)
-            self.model = VideoMAEForVideoClassification.from_pretrained(self.model_path)
-            self.model.to(self.device)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            self.processor = AutoProcessor.from_pretrained(self.model_path)
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16 if self.config.get('qwen_vl_lora', {}).get('bf16', True) else torch.float16,
+                device_map="auto"
+            )
             self.model.eval()
             
             self.logger.info(f"Model loaded from {self.model_path}")
@@ -59,72 +155,104 @@ class ModelEvaluator:
             self.logger.error(f"Error loading model: {e}")
             raise
     
-    def evaluate_on_test_set(self, test_data_dir=None, test_annotations=None):
+    def evaluate_on_test_set(self, test_data_file=None, videos_dir=None):
         """
         Evaluate model on test dataset
         
         Args:
-            test_data_dir: Path to test videos
-            test_annotations: Path to test annotations
+            test_data_file: Path to test JSON file
+            videos_dir: Directory containing test videos
             
         Returns:
             Dictionary containing evaluation metrics
         """
         # Use config paths if not provided
-        if test_data_dir is None:
-            test_data_dir = self.config['data']['test_dir']
-        if test_annotations is None:
-            test_annotations = self.config['data']['test_annotations']
+        if test_data_file is None:
+            test_data_file = self.config.get('qwen_vl_lora', {}).get('dataset_path', 'data/qwen_vl_dataset') + '/val.json'
+        if videos_dir is None:
+            videos_dir = self.config.get('qwen_vl_lora', {}).get('dataset_path', 'data/qwen_vl_dataset') + '/videos'
         
         # Create test dataset
-        test_dataset = VideoBadmintonDataset(
-            data_dir=test_data_dir,
-            annotations_file=test_annotations,
+        test_dataset = QwenVLDataset(
+            data_file=test_data_file,
+            videos_dir=videos_dir,
             processor=self.processor,
-            window_size=self.config['data']['window_size'],
-            sample_rate=self.config['data']['sample_rate'],
-            is_training=False
-        )
-        
-        # Create data loader
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=self.config['training']['batch_size'],
-            shuffle=False,
-            num_workers=4
+            tokenizer=self.tokenizer
         )
         
         # Evaluate
         all_predictions = []
-        all_probabilities = []
+        all_predicted_actions = []
         all_targets = []
+        all_target_actions = []
         
         self.logger.info("Starting evaluation on test set...")
         
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Evaluating"):
-                pixel_values = batch['pixel_values'].to(self.device)
-                labels = batch['labels'].to(self.device)
+        for i in tqdm(range(len(test_dataset)), desc="Evaluating"):
+            item = test_dataset[i]
+            
+            # Skip items with unknown labels
+            if item['label'] == -1:
+                continue
+            
+            # Prepare input
+            conversation = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": item['frames']},
+                        {"type": "text", "text": item['question']}
+                    ]
+                }
+            ]
+            
+            # Apply chat template
+            text = self.processor.apply_chat_template(
+                conversation, tokenize=False, add_generation_prompt=True
+            )
+            
+            # Process inputs
+            inputs = self.processor(
+                text=[text], 
+                videos=[item['frames']], 
+                padding=True, 
+                return_tensors="pt"
+            )
+            inputs = inputs.to(self.device)
+            
+            # Generate response
+            with torch.no_grad():
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    do_sample=False,
+                    temperature=0.1
+                )
                 
-                # Forward pass
-                outputs = self.model(pixel_values=pixel_values)
-                
-                # Get predictions and probabilities
-                logits = outputs.logits
-                probabilities = torch.softmax(logits, dim=-1)
-                predictions = logits.argmax(dim=-1)
-                
-                all_predictions.extend(predictions.cpu().numpy())
-                all_probabilities.extend(probabilities.cpu().numpy())
-                all_targets.extend(labels.cpu().numpy())
+                # Decode response
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                response = self.processor.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                )[0]
+            
+            # Extract predicted action
+            predicted_label = self._extract_action_from_response(response)
+            predicted_action = self.id_to_action.get(predicted_label, "未知动作")
+            target_action = self.id_to_action[item['label']]
+            
+            all_predictions.append(predicted_label)
+            all_predicted_actions.append(predicted_action)
+            all_targets.append(item['label'])
+            all_target_actions.append(target_action)
         
         # Convert to numpy arrays
         all_predictions = np.array(all_predictions)
-        all_probabilities = np.array(all_probabilities)
         all_targets = np.array(all_targets)
         
         # Calculate metrics
-        metrics = self._calculate_metrics(all_targets, all_predictions, all_probabilities)
+        metrics = self._calculate_metrics(all_targets, all_predictions)
         
         self.logger.info("Evaluation completed!")
         self._print_metrics(metrics)
@@ -132,44 +260,62 @@ class ModelEvaluator:
         return {
             'metrics': metrics,
             'predictions': all_predictions,
-            'probabilities': all_probabilities,
-            'targets': all_targets
+            'predicted_actions': all_predicted_actions,
+            'targets': all_targets,
+            'target_actions': all_target_actions
         }
     
-    def _calculate_metrics(self, targets, predictions, probabilities):
+    def _extract_action_from_response(self, response):
+        """Extract action class from model response"""
+        for action, class_id in self.action_mapping.items():
+            if action in response:
+                return class_id
+        
+        return -1  # Unknown action
+    
+    def _calculate_metrics(self, targets, predictions):
         """Calculate evaluation metrics"""
+        # Filter out unknown predictions
+        valid_mask = (predictions != -1)
+        targets_valid = targets[valid_mask]
+        predictions_valid = predictions[valid_mask]
+        
+        if len(targets_valid) == 0:
+            self.logger.warning("No valid predictions found!")
+            return {}
+        
         metrics = {}
         
         # Basic metrics
-        metrics['accuracy'] = accuracy_score(targets, predictions)
-        metrics['precision'] = precision_score(targets, predictions, average='weighted', zero_division=0)
-        metrics['recall'] = recall_score(targets, predictions, average='weighted', zero_division=0)
-        metrics['f1'] = f1_score(targets, predictions, average='weighted', zero_division=0)
+        metrics['accuracy'] = accuracy_score(targets_valid, predictions_valid)
+        metrics['precision'] = precision_score(targets_valid, predictions_valid, average='weighted', zero_division=0)
+        metrics['recall'] = recall_score(targets_valid, predictions_valid, average='weighted', zero_division=0)
+        metrics['f1'] = f1_score(targets_valid, predictions_valid, average='weighted', zero_division=0)
         
         # Per-class metrics
-        metrics['precision_per_class'] = precision_score(targets, predictions, average=None, zero_division=0)
-        metrics['recall_per_class'] = recall_score(targets, predictions, average=None, zero_division=0)
-        metrics['f1_per_class'] = f1_score(targets, predictions, average=None, zero_division=0)
-        
-        # AUC-ROC (for hit class)
-        if probabilities.shape[1] > 1:
-            hit_probs = probabilities[:, 1]  # Probability of hit class
-            metrics['auc_roc'] = roc_auc_score(targets, hit_probs)
+        metrics['precision_per_class'] = precision_score(targets_valid, predictions_valid, average=None, zero_division=0)
+        metrics['recall_per_class'] = recall_score(targets_valid, predictions_valid, average=None, zero_division=0)
+        metrics['f1_per_class'] = f1_score(targets_valid, predictions_valid, average=None, zero_division=0)
         
         # Confusion matrix
-        metrics['confusion_matrix'] = confusion_matrix(targets, predictions)
+        metrics['confusion_matrix'] = confusion_matrix(targets_valid, predictions_valid)
         
         # Classification report
+        action_names = [self.id_to_action[i] for i in range(len(self.action_mapping))]
         metrics['classification_report'] = classification_report(
-            targets, predictions, 
-            target_names=['No Hit', 'Hit'],
-            output_dict=True
+            targets_valid, predictions_valid, 
+            target_names=action_names,
+            output_dict=True,
+            zero_division=0
         )
         
         return metrics
     
     def _print_metrics(self, metrics):
         """Print evaluation metrics"""
+        if not metrics:
+            return
+            
         self.logger.info("=" * 50)
         self.logger.info("EVALUATION RESULTS")
         self.logger.info("=" * 50)
@@ -179,16 +325,15 @@ class ModelEvaluator:
         self.logger.info(f"Recall:    {metrics['recall']:.4f}")
         self.logger.info(f"F1 Score:  {metrics['f1']:.4f}")
         
-        if 'auc_roc' in metrics:
-            self.logger.info(f"AUC-ROC:   {metrics['auc_roc']:.4f}")
-        
-        self.logger.info("\nPer-class metrics:")
-        classes = ['No Hit', 'Hit']
-        for i, class_name in enumerate(classes):
-            if i < len(metrics['precision_per_class']):
-                self.logger.info(f"{class_name:8} - P: {metrics['precision_per_class'][i]:.4f}, "
-                               f"R: {metrics['recall_per_class'][i]:.4f}, "
-                               f"F1: {metrics['f1_per_class'][i]:.4f}")
+        self.logger.info("\nTop-5 Action Performance:")
+        f1_scores = metrics.get('f1_per_class', [])
+        if len(f1_scores) > 0:
+            # Get top 5 performing actions
+            sorted_indices = np.argsort(f1_scores)[::-1][:5]
+            for i, idx in enumerate(sorted_indices):
+                action_name = self.id_to_action.get(idx, f"Action_{idx}")
+                f1_score_val = f1_scores[idx]
+                self.logger.info(f"{i+1:2d}. {action_name:12} - F1: {f1_score_val:.4f}")
     
     def plot_results(self, results, save_dir="evaluation_plots"):
         """
@@ -203,183 +348,85 @@ class ModelEvaluator:
         
         targets = results['targets']
         predictions = results['predictions']
-        probabilities = results['probabilities']
         metrics = results['metrics']
         
-        # Set up the plotting style
-        plt.style.use('seaborn-v0_8')
+        if not metrics:
+            self.logger.warning("No metrics to plot")
+            return
+        
+        # Set up plotting style
+        try:
+            plt.style.use('seaborn-v0_8')
+        except:
+            plt.style.use('default')
         
         # 1. Confusion Matrix
-        plt.figure(figsize=(8, 6))
+        plt.figure(figsize=(12, 10))
+        action_names = [self.id_to_action[i] for i in range(len(self.action_mapping))]
+        
+        # Filter confusion matrix to only include classes that appear in the data
+        cm = metrics['confusion_matrix']
+        unique_labels = np.unique(np.concatenate([targets, predictions]))
+        filtered_action_names = [action_names[i] for i in unique_labels if i < len(action_names)]
+        
         sns.heatmap(
-            metrics['confusion_matrix'], 
+            cm, 
             annot=True, 
             fmt='d',
-            xticklabels=['No Hit', 'Hit'],
-            yticklabels=['No Hit', 'Hit'],
+            xticklabels=filtered_action_names,
+            yticklabels=filtered_action_names,
             cmap='Blues'
         )
-        plt.title('Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
+        plt.title('羽毛球动作识别混淆矩阵')
+        plt.ylabel('真实标签')
+        plt.xlabel('预测标签')
+        plt.xticks(rotation=45, ha='right')
+        plt.yticks(rotation=0)
         plt.tight_layout()
-        plt.savefig(save_dir / 'confusion_matrix.png', dpi=300)
+        plt.savefig(save_dir / 'confusion_matrix.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        # 2. ROC Curve
-        if probabilities.shape[1] > 1:
-            from sklearn.metrics import roc_curve, auc
+        # 2. Action Performance Bar Chart
+        f1_scores = metrics.get('f1_per_class', [])
+        if len(f1_scores) > 0:
+            plt.figure(figsize=(15, 8))
             
-            fpr, tpr, _ = roc_curve(targets, probabilities[:, 1])
-            roc_auc = auc(fpr, tpr)
+            # Only plot actions that appear in the data
+            plot_actions = []
+            plot_f1_scores = []
+            for i in unique_labels:
+                if i < len(action_names) and i < len(f1_scores):
+                    plot_actions.append(action_names[i])
+                    plot_f1_scores.append(f1_scores[i])
             
-            plt.figure(figsize=(8, 6))
-            plt.plot(fpr, tpr, color='darkorange', lw=2, 
-                    label=f'ROC Curve (AUC = {roc_auc:.3f})')
-            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-            plt.xlim([0.0, 1.0])
-            plt.ylim([0.0, 1.05])
-            plt.xlabel('False Positive Rate')
-            plt.ylabel('True Positive Rate')
-            plt.title('Receiver Operating Characteristic (ROC) Curve')
-            plt.legend(loc="lower right")
+            bars = plt.bar(range(len(plot_actions)), plot_f1_scores)
+            plt.xlabel('羽毛球动作')
+            plt.ylabel('F1分数')
+            plt.title('各动作类别F1分数表现')
+            plt.xticks(range(len(plot_actions)), plot_actions, rotation=45, ha='right')
             plt.grid(True, alpha=0.3)
+            
+            # Add value labels on bars
+            for i, (bar, score) in enumerate(zip(bars, plot_f1_scores)):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                        f'{score:.3f}', ha='center', va='bottom', fontsize=8)
+            
             plt.tight_layout()
-            plt.savefig(save_dir / 'roc_curve.png', dpi=300)
+            plt.savefig(save_dir / 'action_performance.png', dpi=300, bbox_inches='tight')
             plt.close()
         
-        # 3. Prediction Distribution
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        hit_probs = probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
-        plt.hist(hit_probs[targets == 0], bins=30, alpha=0.7, label='No Hit', color='blue')
-        plt.hist(hit_probs[targets == 1], bins=30, alpha=0.7, label='Hit', color='red')
-        plt.xlabel('Hit Probability')
-        plt.ylabel('Frequency')
-        plt.title('Prediction Probability Distribution')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.bar(['No Hit', 'Hit'], [np.sum(targets == 0), np.sum(targets == 1)], alpha=0.7)
-        plt.ylabel('Count')
-        plt.title('Class Distribution')
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(save_dir / 'distributions.png', dpi=300)
-        plt.close()
-        
         self.logger.info(f"Plots saved to {save_dir}")
-    
-    def test_on_single_video(self, video_path, output_path=None):
-        """
-        Test model on a single video and output hit predictions
-        
-        Args:
-            video_path: Path to video file
-            output_path: Path to save results (optional)
-            
-        Returns:
-            Dictionary with predictions and timestamps
-        """
-        self.logger.info(f"Testing on single video: {video_path}")
-        
-        # Extract frames from video
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Process video in sliding windows
-        window_size = self.config['data']['window_size']
-        sample_rate = self.config['data']['sample_rate']
-        
-        frames = []
-        frame_timestamps = []
-        
-        frame_idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            if frame_idx % sample_rate == 0:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(frame_rgb)
-                frame_timestamps.append(frame_idx / fps)
-            
-            frame_idx += 1
-        
-        cap.release()
-        
-        # Process frames in sliding windows
-        predictions = []
-        timestamps = []
-        
-        half_window = window_size // 2
-        
-        for i in tqdm(range(half_window, len(frames) - half_window), desc="Processing"):
-            window_frames = frames[i - half_window:i + half_window]
-            
-            # Process with model
-            inputs = self.processor(window_frames, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                probabilities = torch.softmax(outputs.logits, dim=-1)
-                hit_prob = probabilities[0, 1].item()  # Probability of hit
-                
-                predictions.append(hit_prob)
-                timestamps.append(frame_timestamps[i])
-        
-        # Find hit points (peaks in probability)
-        threshold = 0.5  # Configurable threshold
-        hit_points = []
-        
-        for i, (timestamp, prob) in enumerate(zip(timestamps, predictions)):
-            if prob > threshold:
-                # Check if this is a local maximum
-                is_peak = True
-                for j in range(max(0, i-5), min(len(predictions), i+6)):
-                    if j != i and predictions[j] > prob:
-                        is_peak = False
-                        break
-                
-                if is_peak:
-                    hit_points.append({
-                        'timestamp': timestamp,
-                        'confidence': prob
-                    })
-        
-        result = {
-            'video_path': video_path,
-            'hit_points': hit_points,
-            'all_predictions': predictions,
-            'all_timestamps': timestamps,
-            'fps': fps
-        }
-        
-        # Save results if output path provided
-        if output_path:
-            with open(output_path, 'w') as f:
-                json.dump(result, f, indent=2)
-            self.logger.info(f"Results saved to {output_path}")
-        
-        self.logger.info(f"Found {len(hit_points)} hit points")
-        return result
 
 def main():
     """Main evaluation function"""
     logging.basicConfig(level=logging.INFO)
     
-    # Example usage
-    model_path = "models/checkpoints/best_model"
+    # Update these paths based on your actual model location
+    model_path = "models/checkpoints/qwen_vl_lora_512"
     
     if not Path(model_path).exists():
         logging.error(f"Model not found at {model_path}")
-        logging.info("Please train a model first using train_videomae.py")
+        logging.info("Please train a model first or update the model path")
         return
     
     evaluator = ModelEvaluator(model_path)
@@ -388,15 +435,8 @@ def main():
     results = evaluator.evaluate_on_test_set()
     
     # Create plots
-    evaluator.plot_results(results)
-    
-    # Test on single video (if available)
-    sample_video = "data/sample_video.mp4"
-    if Path(sample_video).exists():
-        single_result = evaluator.test_on_single_video(
-            sample_video, 
-            "single_video_results.json"
-        )
+    if results['metrics']:
+        evaluator.plot_results(results)
 
 if __name__ == "__main__":
     main()

@@ -3,26 +3,22 @@ Qwen-VL LoRA Fine-tuning for Badminton Action Recognition
 Fine-tune Qwen-VL using LoRA (Low-Rank Adaptation) for action classification
 """
 
-import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import List
 from dataclasses import dataclass, field
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from transformers import (
     TrainingArguments,
     Trainer,
-    AutoTokenizer,
+    Qwen2_5_VLForConditionalGeneration,
     AutoProcessor,
-    AutoModelForCausalLM,
-    get_linear_schedule_with_warmup
 )
 from peft import LoraConfig, get_peft_model, TaskType
 import yaml
-from tqdm import tqdm
 import cv2
 import numpy as np
 from PIL import Image
@@ -33,30 +29,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class QwenVLTrainingConfig:
-    """Configuration for Qwen-VL LoRA training"""
+    """Configuration for Qwen2.5-VL LoRA fine-tuning following official best practices"""
     
-    # Model configuration
-    model_name: str = "Qwen/Qwen-VL-Chat"
+    # Model configuration - Official Qwen2.5-VL model
+    model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     
-    # LoRA configuration
+    # LoRA configuration - Following official recommendations
     lora_r: int = 64
-    lora_alpha: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.1
-    target_modules: List[str] = field(default_factory=lambda: ["c_attn", "c_proj"])
+    # Target modules for Qwen2.5-VL (will be auto-detected)
+    target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj", 
+        "gate_proj", "up_proj", "down_proj"
+    ])
     
-    # Training configuration
+    # Training configuration - Optimized for vision-language tasks
     epochs: int = 5
-    batch_size: int = 1
-    gradient_accumulation_steps: int = 8
-    learning_rate: float = 1e-4
+    batch_size: int = 2  # Reduced for vision-language processing
+    gradient_accumulation_steps: int = 8  # Increased to maintain effective batch size
+    learning_rate: float = 5e-5  # Reduced from 1e-4 for stability
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
-    max_length: int = 2048
+    max_length: int = 2048  # Increased for vision-language conversations
+    max_grad_norm: float = 1.0  # Add gradient clipping
+    
+    # Vision processing configuration
+    max_frames: int = 8  # Optimal for Qwen2.5-VL
+    frame_size: tuple = (224, 224)
+    vision_processing_batch_size: int = 1  # Process videos one at a time
     
     # Data configuration
     dataset_path: str = "data/qwen_vl_dataset"
-    max_frames: int = 8  # Maximum frames to extract from video
-    frame_size: tuple = (224, 224)
     
     # Output configuration
     output_dir: str = "models/checkpoints/qwen_vl_lora"
@@ -66,10 +70,18 @@ class QwenVLTrainingConfig:
     eval_steps: int = 100
     save_total_limit: int = 3
     
-    # Hardware configuration
-    fp16: bool = True
-    gradient_checkpointing: bool = True
-    dataloader_num_workers: int = 4
+    # Hardware configuration - Optimized for vision-language training
+    fp16: bool = False  # Disabled for numerical stability
+    bf16: bool = True   # Use bf16 for better stability than fp16
+    gradient_checkpointing: bool = False  # Disabled for video processing stability
+    dataloader_num_workers: int = 4  # Increased for video processing
+    dataloader_pin_memory: bool = True
+    dataloader_prefetch_factor: int = 2
+    
+    # Advanced training settings
+    remove_unused_columns: bool = False  # Keep all columns for vision data
+    ddp_find_unused_parameters: bool = False
+    seed: int = 42
 
 class QwenVLActionDataset(Dataset):
     """Dataset for Qwen-VL action recognition fine-tuning"""
@@ -81,6 +93,9 @@ class QwenVLActionDataset(Dataset):
         self.config = config
         self.split = split
         
+        # Cache for extracted frames to avoid repeated video decoding
+        self.frame_cache = {}
+        
         # Load conversation data
         data_file = self.data_path / f"{split}.json"
         if not data_file.exists():
@@ -90,9 +105,37 @@ class QwenVLActionDataset(Dataset):
             self.conversations = json.load(f)
         
         logger.info(f"Loaded {len(self.conversations)} conversations for {split}")
+        
+        # Pre-cache frames for first epoch to improve training speed
+        if len(self.conversations) < 1000:  # Only for smaller datasets
+            logger.info("Pre-caching video frames for faster training...")
+            self._precache_frames()
     
     def __len__(self):
         return len(self.conversations)
+    
+    def _precache_frames(self):
+        """Pre-cache frames for faster training."""
+        from tqdm import tqdm
+        for conversation in tqdm(self.conversations[:100], desc="Pre-caching frames"):  # Cache first 100
+            video_path = conversation["video"]
+            if video_path not in self.frame_cache:
+                try:
+                    frames = self._extract_frames_cached(video_path)
+                    self.frame_cache[video_path] = frames
+                except Exception as e:
+                    logger.warning(f"Failed to cache frames for {video_path}: {e}")
+    
+    def _extract_frames_cached(self, video_path: str) -> List[Image.Image]:
+        """Extract frames with caching."""
+        if video_path in self.frame_cache:
+            return self.frame_cache[video_path]
+        
+        frames = self.extract_video_frames(video_path)
+        # Cache small datasets
+        if len(self.conversations) < 1000:
+            self.frame_cache[video_path] = frames
+        return frames
     
     def extract_video_frames(self, video_path: str) -> List[Image.Image]:
         """Extract frames from video"""
@@ -128,8 +171,31 @@ class QwenVLActionDataset(Dataset):
             if ret:
                 # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # Resize frame
-                frame = cv2.resize(frame, self.config.frame_size)
+                
+                # Resize frame while preserving aspect ratio
+                h, w = frame.shape[:2]
+                target_size = self.config.frame_size[0]  # Use the first dimension as target
+                
+                # Calculate scaling factor to fit the larger dimension to target_size
+                scale = target_size / max(h, w)
+                new_h, new_w = int(h * scale), int(w * scale)
+                
+                # Resize maintaining aspect ratio
+                frame = cv2.resize(frame, (new_w, new_h))
+                
+                # Pad to make it square (224x224)
+                # Calculate padding
+                pad_h = target_size - new_h
+                pad_w = target_size - new_w
+                pad_top = pad_h // 2
+                pad_bottom = pad_h - pad_top
+                pad_left = pad_w // 2
+                pad_right = pad_w - pad_left
+                
+                # Add padding (black borders)
+                frame = cv2.copyMakeBorder(frame, pad_top, pad_bottom, pad_left, pad_right, 
+                                         cv2.BORDER_CONSTANT, value=[0, 0, 0])
+                
                 # Convert to PIL Image
                 pil_frame = Image.fromarray(frame)
                 frames.append(pil_frame)
@@ -146,50 +212,155 @@ class QwenVLActionDataset(Dataset):
     def __getitem__(self, idx):
         conversation = self.conversations[idx]
         
-        # Extract video frames
-        video_frames = self.extract_video_frames(conversation["video"])
+        # Extract video frames with caching
+        video_frames = self._extract_frames_cached(conversation["video"])
         
         # Get conversation pairs
         user_message = conversation["conversations"][0]["value"]
         assistant_message = conversation["conversations"][1]["value"]
         
-        # Create input text (remove <video> token as we'll handle images separately)
+        # Create proper vision-language conversation format following official pattern
         question = user_message.replace("<video>", "").strip()
         
-        # Format input and target
-        input_text = f"用户: {question}\n助手:"
-        target_text = f"{assistant_message}"
-        full_text = f"{input_text} {target_text}"
+        # Format messages using official Qwen2.5-VL conversation pattern
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video", "video": video_frames},  # Pass video frames directly
+                    {"type": "text", "text": question}
+                ]
+            },
+            {
+                "role": "assistant", 
+                "content": assistant_message
+            }
+        ]
         
-        # Tokenize
-        inputs = self.tokenizer(
-            input_text,
-            truncation=True,
-            max_length=self.config.max_length,
-            padding=False,
-            return_tensors=None
-        )
+        # Use processor's chat template (official approach)
+        try:
+            # Apply chat template with both user and assistant messages
+            full_text = self.processor.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=False
+            )
+            
+            # Apply chat template for input only (user message)
+            input_text = self.processor.apply_chat_template(
+                messages[:1], 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+        except Exception as e:
+            logger.warning(f"Chat template failed: {e}, falling back to manual formatting")
+            # Fallback to manual formatting
+            input_text = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+            full_text = f"{input_text}{assistant_message}<|im_end|>"
         
-        targets = self.tokenizer(
-            full_text,
-            truncation=True,
-            max_length=self.config.max_length,
-            padding=False,
-            return_tensors=None
-        )
+        # Process with the official processor
+        try:
+            # For training, we process the full conversation
+            inputs = self.processor(
+                text=full_text,  # Pass as single string, not list
+                videos=video_frames,  # Pass frames directly without list wrapper
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_length,
+                return_tensors="pt"
+            )
+            
+            # Get input-only encoding for label masking
+            input_only = self.processor(
+                text=input_text,  # Pass as single string, not list
+                videos=video_frames,  # Pass frames directly without list wrapper
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_length,
+                return_tensors="pt"
+            )
+            
+        except Exception as e:
+            logger.warning(f"Processor failed: {e}, using tokenizer only")
+            # Fallback to tokenizer only
+            inputs = self.processor.tokenizer(
+                full_text,
+                truncation=True,
+                max_length=self.config.max_length,
+                padding=False,
+                return_tensors="pt"
+            )
+            input_only = self.processor.tokenizer(
+                input_text,
+                truncation=True,
+                max_length=self.config.max_length,
+                padding=False,
+                return_tensors="pt"
+            )
         
-        # Create labels (mask input tokens)
-        labels = targets["input_ids"].copy()
-        input_len = len(inputs["input_ids"])
-        labels[:input_len] = [-100] * input_len  # Ignore input tokens in loss
+        # Extract tensors and convert to lists for data collator
+        try:
+            if torch.is_tensor(inputs["input_ids"]):
+                # Handle tensor shape properly - only squeeze if batch dimension exists
+                input_ids_tensor = inputs["input_ids"]
+                attention_mask_tensor = inputs["attention_mask"]
+                
+                if input_ids_tensor.dim() > 1:
+                    input_ids = input_ids_tensor.squeeze(0).tolist()
+                    attention_mask = attention_mask_tensor.squeeze(0).tolist()
+                else:
+                    input_ids = input_ids_tensor.tolist()
+                    attention_mask = attention_mask_tensor.tolist()
+            else:
+                input_ids = inputs["input_ids"]
+                attention_mask = inputs["attention_mask"]
+        except (KeyError, TypeError) as e:
+            logger.error(f"Failed to extract input_ids: {e}")
+            raise ValueError(f"Invalid processor output: {e}")
         
-        return {
-            "input_ids": targets["input_ids"],
-            "attention_mask": targets["attention_mask"],
+        # Create labels (mask input tokens) - ensure length matches input_ids
+        labels = input_ids[:]
+        try:
+            if torch.is_tensor(input_only["input_ids"]):
+                input_only_tensor = input_only["input_ids"]
+                if input_only_tensor.dim() > 1:
+                    input_len = len(input_only_tensor.squeeze(0).tolist())
+                else:
+                    input_len = len(input_only_tensor.tolist())
+            else:
+                input_len = len(input_only["input_ids"])
+        except (KeyError, TypeError):
+            input_len = len(input_ids) // 2  # Rough estimate
+        
+        # Ensure labels and input_ids have the same length
+        if len(labels) != len(input_ids):
+            logger.warning(f"Length mismatch: input_ids={len(input_ids)}, labels={len(labels)}, adjusting...")
+            if len(labels) < len(input_ids):
+                # Pad labels to match input_ids length
+                labels.extend([-100] * (len(input_ids) - len(labels)))
+            else:
+                # Truncate labels to match input_ids length  
+                labels = labels[:len(input_ids)]
+        
+        # Mask input tokens in labels
+        labels[:input_len] = [-100] * input_len
+        
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "labels": labels,
-            "images": video_frames,  # Pass frames for potential future use
             "conversation_id": conversation.get("id", f"conv_{idx}")
         }
+        
+        # Add vision features if available - include all video-specific tensors
+        video_tensor_keys = ["pixel_values", "pixel_values_videos", "video_grid_thw", "second_per_grid_ts"]
+        
+        for key in video_tensor_keys:
+            if key in inputs and inputs[key] is not None:
+                result[key] = inputs[key]
+        
+        return result
 
 class QwenVLLoRATrainer:
     """Trainer for Qwen-VL LoRA fine-tuning"""
@@ -200,34 +371,43 @@ class QwenVLLoRATrainer:
         self.setup_datasets()
         
     def setup_model_and_tokenizer(self):
-        """Setup model, tokenizer, and processor"""
-        logger.info(f"Loading model: {self.config.model_name}")
+        """Setup model and processor following official Qwen2.5-VL patterns"""
+        logger.info(f"Loading model and processor: {self.config.model_name}")
         
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_name,
-            trust_remote_code=True,
-            use_fast=False
-        )
-        
-        # Load processor (for potential image handling)
+        # Load processor first (official recommended approach)
         try:
             self.processor = AutoProcessor.from_pretrained(
                 self.config.model_name,
+                trust_remote_code=True,
+                use_fast=False  # Use slow processor for compatibility with saved checkpoints
+            )
+            logger.info("✅ Processor loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to load processor: {e}")
+            raise RuntimeError(f"Could not load Qwen2VL processor: {e}")
+        
+        # Access tokenizer through processor (official pattern)
+        self.tokenizer = self.processor.tokenizer
+        
+        # Load model with official recommended settings
+        try:
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.config.model_name,
+                torch_dtype="auto",  # Official recommendation
+                device_map="auto",   # Official recommendation
                 trust_remote_code=True
             )
-        except:
-            self.processor = None
-            logger.warning("Could not load processor, using tokenizer only")
-        
-        # Load model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_name,
-            torch_dtype=torch.float16 if self.config.fp16 else torch.float32,
-            device_map="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
+            logger.info("✅ Model loaded successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to load model with auto settings: {e}")
+            logger.info("Trying fallback loading...")
+            # Fallback without device_map
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                self.config.model_name,
+                torch_dtype=torch.float16 if self.config.fp16 else torch.float32,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
         
         # Setup LoRA
         self.setup_lora()
@@ -236,24 +416,141 @@ class QwenVLLoRATrainer:
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
             
+            # Enable input gradients for gradient checkpointing compatibility
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
+            else:
+                def make_inputs_require_grad(module, input, output):
+                    output.requires_grad_(True)
+                
+                self.model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+            
+            logger.info("✅ Gradient checkpointing enabled with input gradients")
+            
     def setup_lora(self):
         """Setup LoRA configuration"""
         logger.info("Setting up LoRA configuration")
+        
+        # Print all available modules for debugging
+        available_modules = []
+        logger.info("Available model modules with weights:")
+        for name, module in self.model.named_modules():
+            if hasattr(module, 'weight'):
+                available_modules.append(name)
+                if any(pattern in name for pattern in ['proj', 'linear', 'fc', 'attn']):
+                    logger.info(f"  {name}: {type(module).__name__} - {module.weight.shape if hasattr(module, 'weight') else 'No weight'}")
+        
+        # Find correct target modules for Qwen2.5-VL
+        potential_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        target_modules = []
+        
+        for pattern in potential_targets:
+            matching = [name for name in available_modules if pattern in name and 'language_model' in name]
+            if matching:
+                target_modules.extend(matching)
+                logger.info(f"Found modules for {pattern}: {matching[:3]}...")  # Show first 3
+        
+        # If no language_model modules found, try without that constraint
+        if not target_modules:
+            logger.warning("No language_model modules found, trying broader search...")
+            for pattern in ["q_proj", "v_proj"]:  # Conservative fallback
+                matching = [name for name in available_modules if pattern in name]
+                if matching:
+                    target_modules.extend(matching[:5])  # Limit to avoid too many
+        
+        if not target_modules:
+            # Ultimate fallback - find any linear layers
+            logger.warning("No projection modules found, using any Linear layers...")
+            target_modules = [name for name in available_modules if 'Linear' in str(type(self.model.get_submodule(name)))][:10]
+        
+        logger.info(f"Selected target modules ({len(target_modules)}): {target_modules[:5]}...")
+        
+        if not target_modules:
+            raise RuntimeError("Could not find any suitable modules for LoRA adaptation!")
         
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
             lora_dropout=self.config.lora_dropout,
-            target_modules=self.config.target_modules,
+            target_modules=target_modules,
             bias="none",
         )
         
         # Apply LoRA to model
-        self.model = get_peft_model(self.model, lora_config)
+        try:
+            self.model = get_peft_model(self.model, lora_config)
+            logger.info("LoRA applied successfully")
+        except Exception as e:
+            logger.error(f"Failed to apply LoRA: {e}")
+            # Try with just the first few modules
+            logger.info("Trying with reduced target modules...")
+            lora_config.target_modules = target_modules[:3] if len(target_modules) > 3 else target_modules
+            self.model = get_peft_model(self.model, lora_config)
         
         # Print trainable parameters
         self.model.print_trainable_parameters()
+        
+        # Explicitly set model to training mode
+        self.model.train()
+        
+        # Verify we have trainable parameters
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        
+        if trainable_params == 0:
+            raise RuntimeError("No trainable parameters found after LoRA setup!")
+        
+        logger.info(f"Trainable: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+        
+        # Log some trainable parameter names for verification
+        trainable_names = [name for name, param in self.model.named_parameters() if param.requires_grad]
+        logger.info(f"Trainable parameter examples: {trainable_names[:5]}")
+        
+    def verify_gradients(self):
+        """Verify that model has trainable parameters with gradients"""
+        trainable_params = []
+        frozen_params = []
+        trainable_param_count = 0
+        frozen_param_count = 0
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                trainable_params.append(name)
+                trainable_param_count += param.numel()
+            else:
+                frozen_params.append(name)
+                frozen_param_count += param.numel()
+        
+        total_param_count = trainable_param_count + frozen_param_count
+        trainable_percentage = 100 * trainable_param_count / total_param_count if total_param_count > 0 else 0
+        
+        logger.info(f"Gradient verification:")
+        logger.info(f"  Trainable parameters: {len(trainable_params):,} layers, {trainable_param_count:,} elements ({trainable_percentage:.2f}%)")
+        logger.info(f"  Frozen parameters: {len(frozen_params):,} layers, {frozen_param_count:,} elements")
+        
+        if not trainable_params:
+            raise RuntimeError("No parameters require gradients! Training will fail.")
+        
+        # Show some examples
+        logger.info(f"  Trainable examples: {trainable_params[:5]}")
+        if len(trainable_params) > 5:
+            logger.info(f"    ... and {len(trainable_params) - 5} more")
+        
+        # Verify specific LoRA parameters exist
+        lora_params = [name for name in trainable_params if 'lora_' in name]
+        lora_param_count = 0
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and 'lora_' in name:
+                lora_param_count += param.numel()
+                
+        if lora_params:
+            logger.info(f"  LoRA parameters found: {len(lora_params)} layers, {lora_param_count:,} elements")
+            logger.info(f"  LoRA examples: {lora_params[:3]}")
+        else:
+            logger.warning("  No LoRA parameters found in trainable parameters!")
+        
+        return len(trainable_params) > 0
         
     def setup_datasets(self):
         """Setup training and validation datasets"""
@@ -276,14 +573,16 @@ class QwenVLLoRATrainer:
         )
         
     def data_collator(self, batch):
-        """Custom data collator for batching"""
-        input_ids = [torch.tensor(item["input_ids"]) for item in batch]
-        attention_masks = [torch.tensor(item["attention_mask"]) for item in batch]
-        labels = [torch.tensor(item["labels"]) for item in batch]
+        """Custom data collator for vision-language training"""
+        # Extract text features
+        input_ids = [item["input_ids"] for item in batch]
+        attention_masks = [item["attention_mask"] for item in batch]
+        labels = [item["labels"] for item in batch]
         
-        # Pad sequences
+        # Find max length
         max_len = max(len(ids) for ids in input_ids)
         
+        # Pad sequences to max length
         padded_input_ids = []
         padded_attention_masks = []
         padded_labels = []
@@ -296,19 +595,94 @@ class QwenVLLoRATrainer:
             pad_len = max_len - len(ids)
             
             if pad_len > 0:
-                ids = torch.cat([ids, torch.full((pad_len,), self.tokenizer.pad_token_id)])
-                mask = torch.cat([mask, torch.zeros(pad_len)])
-                label = torch.cat([label, torch.full((pad_len,), -100)])
+                # Pad with appropriate tokens
+                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                ids = ids + [pad_token_id] * pad_len
+                mask = mask + [0] * pad_len
+                label = label + [-100] * pad_len
             
             padded_input_ids.append(ids)
             padded_attention_masks.append(mask)
             padded_labels.append(label)
         
-        return {
-            "input_ids": torch.stack(padded_input_ids),
-            "attention_mask": torch.stack(padded_attention_masks),
-            "labels": torch.stack(padded_labels)
+        # Create result dictionary
+        result = {
+            "input_ids": torch.tensor(padded_input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(padded_attention_masks, dtype=torch.long),
+            "labels": torch.tensor(padded_labels, dtype=torch.long)
         }
+
+        # Handle vision features if present
+        pixel_values = [item.get("pixel_values") for item in batch]
+        if any(pv is not None for pv in pixel_values):
+            # Stack pixel values if present
+            valid_pixel_values = [pv for pv in pixel_values if pv is not None]
+            if valid_pixel_values:
+                try:
+                    # Convert to tensors and stack
+                    if torch.is_tensor(valid_pixel_values[0]):
+                        result["pixel_values"] = torch.stack(valid_pixel_values)
+                    else:
+                        result["pixel_values"] = torch.stack([torch.tensor(pv) for pv in valid_pixel_values])
+                except Exception as e:
+                    logger.warning(f"Failed to stack pixel values: {e}")
+
+        # Handle video-specific tensors for Qwen2.5-VL
+        video_tensors = ["pixel_values_videos", "video_grid_thw", "second_per_grid_ts"]
+        
+        for tensor_name in video_tensors:
+            tensor_values = [item.get(tensor_name) for item in batch]
+            if any(tv is not None for tv in tensor_values):
+                valid_tensor_values = [tv for tv in tensor_values if tv is not None]
+                if valid_tensor_values:
+                    try:
+                        # Special handling for video_grid_thw and metadata tensors
+                        if tensor_name in ["video_grid_thw", "second_per_grid_ts"]:
+                            if torch.is_tensor(valid_tensor_values[0]):
+                                # Ensure metadata tensors don't require gradients
+                                if tensor_name == "video_grid_thw":
+                                    result[tensor_name] = torch.cat(valid_tensor_values, dim=0).detach()
+                                else:
+                                    result[tensor_name] = torch.stack(valid_tensor_values).detach()
+                            else:
+                                if tensor_name == "video_grid_thw":
+                                    result[tensor_name] = torch.cat([torch.tensor(tv, requires_grad=False) for tv in valid_tensor_values], dim=0)
+                                else:
+                                    result[tensor_name] = torch.stack([torch.tensor(tv, requires_grad=False) for tv in valid_tensor_values])
+                        else:
+                            # For other tensors (like pixel_values_videos), preserve gradient flow
+                            if torch.is_tensor(valid_tensor_values[0]):
+                                # Ensure pixel_values_videos can flow gradients for training
+                                if tensor_name == "pixel_values_videos":
+                                    result[tensor_name] = torch.stack(valid_tensor_values, dim=0).squeeze(1)
+                                else:
+                                    result[tensor_name] = torch.stack(valid_tensor_values)
+                            else:
+                                result[tensor_name] = torch.stack([torch.tensor(tv) for tv in valid_tensor_values])
+                    except Exception as e:
+                        # For non-stackable tensors, try concatenation
+                        try:
+                            if torch.is_tensor(valid_tensor_values[0]):
+                                result[tensor_name] = torch.cat(valid_tensor_values, dim=0)
+                            else:
+                                result[tensor_name] = torch.cat([torch.tensor(tv) for tv in valid_tensor_values], dim=0)
+                        except Exception as e2:
+                            logger.warning(f"Failed to process {tensor_name}: {e}, {e2}")
+
+        # Handle video grid metadata if present (legacy support)
+        video_grid_thw = [item.get("video_grid_thw") for item in batch]
+        if any(vgt is not None for vgt in video_grid_thw) and "video_grid_thw" not in result:
+            valid_video_grid = [vgt for vgt in video_grid_thw if vgt is not None]
+            if valid_video_grid:
+                try:
+                    if torch.is_tensor(valid_video_grid[0]):
+                        result["video_grid_thw"] = torch.stack(valid_video_grid)
+                    else:
+                        result["video_grid_thw"] = torch.stack([torch.tensor(vgt) for vgt in valid_video_grid])
+                except Exception as e:
+                    logger.warning(f"Failed to stack video grid: {e}")
+        
+        return result
         
     def train(self):
         """Start training"""
@@ -333,7 +707,7 @@ class QwenVLLoRATrainer:
         with open(output_dir / "training_config.json", "w", encoding="utf-8") as f:
             json.dump(config_dict, f, ensure_ascii=False, indent=2)
         
-        # Training arguments
+        # Training arguments - Following official best practices
         training_args = TrainingArguments(
             output_dir=str(output_dir),
             num_train_epochs=self.config.epochs,
@@ -343,27 +717,38 @@ class QwenVLLoRATrainer:
             learning_rate=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             warmup_ratio=self.config.warmup_ratio,
+            max_grad_norm=self.config.max_grad_norm,  # Add gradient clipping
             logging_steps=self.config.logging_steps,
             save_steps=self.config.save_steps,
             eval_strategy=self.config.eval_strategy,
             eval_steps=self.config.eval_steps,
             save_total_limit=self.config.save_total_limit,
             fp16=self.config.fp16,
+            bf16=self.config.bf16,
             gradient_checkpointing=self.config.gradient_checkpointing,
             dataloader_num_workers=self.config.dataloader_num_workers,
-            report_to=[],  # Disable wandb for now
+            dataloader_pin_memory=self.config.dataloader_pin_memory,
+            dataloader_prefetch_factor=self.config.dataloader_prefetch_factor,
+            report_to=[],  # Disable external logging for simplicity
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
+            # Advanced settings
+            remove_unused_columns=self.config.remove_unused_columns,
+            ddp_find_unused_parameters=self.config.ddp_find_unused_parameters,
+            seed=self.config.seed,
+            # Memory optimizations
+            optim="adamw_torch",  # Official recommendation
+            lr_scheduler_type="cosine",  # Better for fine-tuning
         )
         
-        # Create trainer
+        # Create trainer with proper processor integration
         trainer = Trainer(
             model=self.model,
             args=training_args,
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
-            tokenizer=self.tokenizer,
+            processing_class=self.processor,  # Use processor instead of tokenizer
             data_collator=self.data_collator,
         )
         
@@ -371,14 +756,21 @@ class QwenVLLoRATrainer:
         logger.info(f"Training on {len(self.train_dataset)} samples")
         logger.info(f"Validation on {len(self.eval_dataset)} samples")
         
+        # Verify gradients before training
+        logger.info("Performing final gradient verification...")
+        if not self.verify_gradients():
+            raise RuntimeError("Gradient verification failed!")
+        
         trainer.train()
         
         # Save final model
         final_model_path = output_dir / "final_model"
         trainer.save_model(str(final_model_path))
-        self.tokenizer.save_pretrained(str(final_model_path))
         
-        logger.info(f"Training completed! Model saved to {final_model_path}")
+        # Save processor (includes tokenizer)
+        self.processor.save_pretrained(str(final_model_path))
+        
+        logger.info(f"Training completed! Model and processor saved to {final_model_path}")
         
         return trainer
 
@@ -392,6 +784,11 @@ def load_training_config(config_path: str = None) -> QwenVLTrainingConfig:
         config = QwenVLTrainingConfig()
         for key, value in config_dict.get('qwen_vl_lora', {}).items():
             if hasattr(config, key):
+                # Handle type conversion for specific fields
+                if key == 'learning_rate' and isinstance(value, str):
+                    value = float(value)
+                elif key == 'frame_size' and isinstance(value, list):
+                    value = tuple(value)
                 setattr(config, key, value)
         
         return config
@@ -404,18 +801,18 @@ def main():
     
     parser = argparse.ArgumentParser(description="Train Qwen-VL LoRA for badminton action recognition")
     parser.add_argument("--config", type=str, help="Path to configuration file")
-    parser.add_argument("--dataset-path", type=str, default="data/qwen_vl_dataset", help="Dataset path")
-    parser.add_argument("--output-dir", type=str, default="models/checkpoints/qwen_vl_lora", help="Output directory")
-    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--dataset-path", type=str, help="Dataset path")
+    parser.add_argument("--output-dir", type=str, help="Output directory")
+    parser.add_argument("--epochs", type=int, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, help="Batch size")
+    parser.add_argument("--learning-rate", type=float, help="Learning rate")
     
     args = parser.parse_args()
     
     # Load configuration
     config = load_training_config(args.config)
     
-    # Override with command line arguments
+    # Override with command line arguments (only if provided)
     if args.dataset_path:
         config.dataset_path = args.dataset_path
     if args.output_dir:
@@ -438,7 +835,7 @@ def main():
     try:
         # Create trainer and start training
         trainer_obj = QwenVLLoRATrainer(config)
-        trainer = trainer_obj.train()
+        trainer_obj.train()
         
         logger.info("✅ Qwen-VL LoRA training completed successfully!")
         

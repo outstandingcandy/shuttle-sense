@@ -14,8 +14,7 @@ from pathlib import Path
 # Add the src directory to the path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from hit_detection.detector import HitPointDetector
-from hit_detection.enhanced_detector import EnhancedHitPointDetector
+from hit_detection import HitPointDetector
 from video_segmentation.segmenter import VideoSegmenter
 from annotation.annotator import VideoAnnotator
 from pipeline import ShuttleSensePipeline
@@ -71,16 +70,10 @@ def main():
     if args.skip_detection:
         hit_detector = None
     else:
-        # Choose detector based on configuration
+        # Use unified hit detector with Qwen-VL
         hit_config = config["hit_detection"]
-        use_enhanced = hit_config.get("use_enhanced_detector", False)
-        
-        if use_enhanced:
-            logger.info("Using enhanced hit detector with action classification")
-            hit_detector = EnhancedHitPointDetector(hit_config)
-        else:
-            logger.info("Using standard hit detector")
-            hit_detector = HitPointDetector(hit_config)
+        logger.info("Using unified hit detector with Qwen-VL")
+        hit_detector = HitPointDetector(hit_config)
     
     segmenter = None if args.skip_segmentation else VideoSegmenter(config["video_segmentation"])
     annotator = None if args.skip_annotation else VideoAnnotator(config["annotation"])

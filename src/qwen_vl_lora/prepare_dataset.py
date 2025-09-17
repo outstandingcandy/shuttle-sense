@@ -15,7 +15,7 @@ class QwenVLDatasetPreparator:
     """Prepare VideoBadminton_Dataset for Qwen-VL LoRA fine-tuning"""
     
     def __init__(self, 
-                 source_dataset_path="/home/ubuntu/Project/shuttle-sense/VideoBadminton_Dataset",
+                 source_dataset_path="/home/ubuntu/shuttle-sense/VideoBadminton_Dataset",
                  output_path="data/qwen_vl_dataset"):
         self.source_path = Path(source_dataset_path)
         self.output_path = Path(output_path)

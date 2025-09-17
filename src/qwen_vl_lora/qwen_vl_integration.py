@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 # Import existing components
-from src.hit_detection.enhanced_detector import EnhancedHitDetector
+from src.hit_detection.detector import HitPointDetector
 from src.qwen_vl_lora.inference_qwen_vl import QwenVLActionRecognizer
 
 # Setup logging
@@ -37,8 +37,8 @@ class QwenVLEnhancedDetector:
         self.config = config
         self.use_qwen_vl = use_qwen_vl
         
-        # Initialize existing enhanced detector
-        self.hit_detector = EnhancedHitDetector(config)
+        # Initialize existing detector
+        self.hit_detector = HitPointDetector(config)
         
         # Initialize Qwen-VL recognizer if enabled
         self.qwen_vl_recognizer = None
@@ -71,7 +71,21 @@ class QwenVLEnhancedDetector:
         Returns:
             List of hit detection results
         """
-        return self.hit_detector.detect_hits(video_path)
+        # Use the new unified detector
+        hit_timestamps = self.hit_detector.detect(video_path)
+        results = self.hit_detector.get_detailed_results()
+        
+        # Convert to expected format
+        hits = []
+        for hit_data in results["hit_points"]:
+            hits.append({
+                "timestamp": hit_data["timestamp"],
+                "frame_index": hit_data["frame_index"],
+                "confidence": hit_data["confidence"],
+                "action_class": hit_data.get("action_class", "unknown")
+            })
+        
+        return hits
     
     def classify_action_videomae(self, video_segment: Union[str, np.ndarray]) -> Dict[str, Any]:
         """
@@ -83,7 +97,15 @@ class QwenVLEnhancedDetector:
         Returns:
             Action classification result
         """
-        return self.hit_detector.classify_action(video_segment)
+        # The new HitPointDetector doesn't have a separate classify_action method
+        # For now, return a placeholder - this would need proper implementation
+        # if VideoMAE-only classification is needed
+        return {
+            "action": "unknown", 
+            "confidence": 0.0,
+            "method": "videomae",
+            "note": "VideoMAE classification not implemented in current detector"
+        }
     
     def classify_action_qwen_vl(self, video_path: str, question: str = None) -> Dict[str, Any]:
         """
@@ -321,13 +343,13 @@ class QwenVLEnhancedDetector:
     def get_model_info(self) -> Dict[str, Any]:
         """Get information about loaded models"""
         info = {
-            "enhanced_detector": True,
-            "videomae_available": self.hit_detector.use_custom_model,
+            "detector": True,
+            "videomae_available": self.hit_detector.model_type == "videomae_fallback",
             "qwen_vl_available": self.use_qwen_vl and self.qwen_vl_recognizer is not None
         }
         
         if info["videomae_available"]:
-            info["videomae_model_path"] = self.config.get("hit_detection", {}).get("custom_model_path")
+            info["videomae_model_path"] = "fallback_model"
         
         if info["qwen_vl_available"]:
             info["qwen_vl_model_path"] = str(self.qwen_vl_recognizer.model_path)

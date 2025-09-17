@@ -6,19 +6,33 @@ paths:
   output_dir: "output"
   models_dir: "models"
 
-# Hit Detection Model
+# Hit Detection Parameters
 hit_detection:
-  # Original model for fallback
-  # model_id: "phubinhdang/videomae-base-finetuned-badminton-rally"
-  model_id: "yexter/videomae-base-Badminton_strokes-finetuned-stroke-classification"
-  confidence_threshold: 0.2
-  sample_rate: 5  # Process every N frames
-  window_size: 16  # Number of frames to analyze together
+  # Detector configuration
+  confidence_threshold: 0.8
+  sample_rate: 4
+  window_size: 8
+  min_pixels: 200704  # 256 * 28 * 28
+  max_pixels: 1003520  # 1280 * 28 * 28
   
-  # Enhanced model settings
-  use_enhanced_detector: true  # Use enhanced detector with action classification
-  use_custom_model: true       # Use custom trained model if available
-  custom_model_path: "models/checkpoints/action_classification/best_model"  # Path to trained model
+  # Hit detection settings
+  min_hit_interval: 0.5  # Minimum seconds between detected hits
+  peak_detection_window: 5  # Frames to check for local maxima
+
+# Video Processing
+video_processing:
+  # Frame extraction
+  frame_extraction:
+    max_resolution: [640, 480]  # Resize videos if larger
+    color_space: "RGB"
+    normalize: true
+  
+  # Preprocessing
+  preprocessing:
+    cache_frames: true  # Cache extracted frames
+    cache_size_limit: "2GB"  # Maximum cache size
+    parallel_processing: true
+    num_workers: 2
 
 # Video Segmentation
 video_segmentation:
@@ -31,17 +45,75 @@ annotation:
   model: "gemini-pro-vision"  # or "gpt-4o" if using OpenAI
   temperature: 0.2
   max_tokens: 300
-  
-# Qwen-VL LoRA Configuration
-qwen_vl:
-  enabled: true  # Enable Qwen-VL LoRA integration
-  model_path: "models/checkpoints/qwen_vl_lora/final_model"  # Path to trained LoRA model
-  config_path: "configs/qwen_vl_lora_config.yaml"  # Path to Qwen-VL configuration
-  use_ensemble: true  # Use ensemble of VideoMAE and Qwen-VL
-  confidence_threshold: 0.8  # Confidence threshold for Qwen-VL primary decision
 
-# System
+# System Settings
 system:
-  batch_size: 8
+  # Hardware
+  device: "auto"  # "auto", "cuda", "cpu"
+  mixed_precision: true  # Use FP16 for faster inference
+  
+  # Performance
+  batch_size: 16
   num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+  
+  # Logging
   log_level: "INFO"
+  log_file: "logs/shuttlesense.log"
+  
+  # Memory management
+  memory_cleanup_interval: 100  # Clean up every N inferences
+  max_memory_usage: "80%"  # Maximum GPU memory usage
+
+# Qwen VL LoRA Training Configuration
+qwen_vl_lora:
+  # Model configuration
+  model_name: "Qwen/Qwen2.5-VL-3B-Instruct"
+  
+  # LoRA configuration
+  lora_r: 64
+  lora_alpha: 32
+  lora_dropout: 0.1
+  
+  # Training configuration
+  epochs: 5
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 5e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_length: 8192
+  max_grad_norm: 1.0
+  
+  # Vision processing
+  max_frames: 8
+  frame_size: [1024, 1024]
+  
+  # Data configuration
+  dataset_path: "data/qwen_vl_dataset"
+  
+  # Output configuration
+  output_dir: "models/checkpoints/qwen_vl_lora_1024"
+  logging_steps: 10
+  save_steps: 100
+  eval_strategy: "steps"
+  eval_steps: 100
+  save_total_limit: 3
+  
+  # Hardware configuration
+  fp16: false
+  bf16: true
+  gradient_checkpointing: true # Disable to avoid gradient issues
+  dataloader_num_workers: 12
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 8
+  
+  # Advanced training settings
+  remove_unused_columns: false
+  ddp_find_unused_parameters: false
+  seed: 42
+
+inference:
+  max_frames: 8
+  frame_size: [1024, 1024]

@@ -56,31 +56,24 @@ class ShuttleSensePipeline:
         if self.hit_detector:
             self.logger.info("Starting hit point detection...")
             
-            # Get detection results (enhanced detector returns more info)
-            if hasattr(self.hit_detector, 'model_type'):
-                # Enhanced detector
-                results = self.hit_detector.detect(video_path)
-                hit_points = [hit['timestamp'] for hit in results['hit_points']]
-                
-                # Save detailed results
+            # Get detection results (unified detector returns simple timestamps for backward compatibility)
+            hit_points = self.hit_detector.detect(video_path)
+            
+            # Save hit points
+            with open(hit_points_path, 'w') as f:
+                json.dump({"hit_timestamps": hit_points}, f, indent=2)
+            
+            # Save detailed results if available
+            detailed_results = self.hit_detector.get_detailed_results()
+            if detailed_results:
                 with open(detailed_results_path, 'w') as f:
-                    json.dump(results, f, indent=2, default=str)
+                    json.dump(detailed_results, f, indent=2, default=str)
                 
-                # Save hit points in original format for compatibility
-                with open(hit_points_path, 'w') as f:
-                    json.dump({"hit_timestamps": hit_points}, f, indent=2)
-                
-                self.logger.info(f"Enhanced detection completed. Found {len(hit_points)} hit points with action classification")
-                
+                model_type = detailed_results.get('model_info', {}).get('model_type', 'unknown')
+                hit_count = len(detailed_results.get('hit_points', []))
+                self.logger.info(f"Detection completed using {model_type} model. Found {hit_count} hit points")
             else:
-                # Original detector
-                hit_points = self.hit_detector.detect(video_path)
-                
-                # Save hit points
-                with open(hit_points_path, 'w') as f:
-                    json.dump({"hit_timestamps": hit_points}, f, indent=2)
-                
-                self.logger.info(f"Detected {len(hit_points)} hit points")
+                self.logger.info(f"Detection completed. Found {len(hit_points)} hit points")
         else:
             self.logger.info("Skipping hit point detection")
             # Try to load hit points from existing file
