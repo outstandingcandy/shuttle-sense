@@ -70,6 +70,10 @@ class QwenVLTrainingConfig:
     eval_steps: int = 100
     save_total_limit: int = 3
     
+    # Checkpoint configuration
+    resume_from_checkpoint: str = None  # Path to checkpoint to resume from
+    auto_find_last_checkpoint: bool = True  # Automatically find last checkpoint in output_dir
+    
     # Hardware configuration - Optimized for vision-language training
     fp16: bool = False  # Disabled for numerical stability
     bf16: bool = True   # Use bf16 for better stability than fp16
@@ -551,6 +555,161 @@ class QwenVLLoRATrainer:
             logger.warning("  No LoRA parameters found in trainable parameters!")
         
         return len(trainable_params) > 0
+    
+    def find_last_checkpoint(self, output_dir: str) -> str:
+        """Find the last checkpoint in the output directory"""
+        output_path = Path(output_dir)
+        
+        if not output_path.exists():
+            return None
+        
+        # Look for checkpoint directories
+        checkpoint_dirs = []
+        for item in output_path.iterdir():
+            if item.is_dir() and item.name.startswith("checkpoint-"):
+                try:
+                    step_num = int(item.name.split("-")[1])
+                    checkpoint_dirs.append((step_num, item))
+                except (ValueError, IndexError):
+                    continue
+        
+        if not checkpoint_dirs:
+            return None
+        
+        # Return the checkpoint with the highest step number
+        latest_checkpoint = max(checkpoint_dirs, key=lambda x: x[0])[1]
+        
+        # Verify it's a valid checkpoint
+        if (latest_checkpoint / "pytorch_model.bin").exists() or \
+           (latest_checkpoint / "model.safetensors").exists() or \
+           (latest_checkpoint / "adapter_model.safetensors").exists():
+            return str(latest_checkpoint)
+        
+        return None
+    
+    def load_from_checkpoint(self, checkpoint_path: str):
+        """Load model state from checkpoint"""
+        checkpoint_path = Path(checkpoint_path)
+        
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        logger.info(f"Loading model from checkpoint: {checkpoint_path}")
+        
+        try:
+            # Load LoRA weights if available
+            adapter_model_path = checkpoint_path / "adapter_model.bin"
+            adapter_config_path = checkpoint_path / "adapter_config.json"
+            
+            if adapter_model_path.exists() and adapter_config_path.exists():
+                logger.info("Loading LoRA adapter weights...")
+                
+                # Load the adapter config to verify compatibility
+                with open(adapter_config_path, 'r') as f:
+                    adapter_config = json.load(f)
+                
+                # Load adapter weights
+                adapter_weights = torch.load(adapter_model_path, map_location="cpu")
+                
+                # Apply weights to the model
+                missing_keys, unexpected_keys = self.model.load_state_dict(adapter_weights, strict=False)
+                
+                if missing_keys:
+                    logger.warning(f"Missing keys when loading checkpoint: {missing_keys}")
+                if unexpected_keys:
+                    logger.warning(f"Unexpected keys when loading checkpoint: {unexpected_keys}")
+                
+                logger.info("✅ LoRA adapter weights loaded successfully")
+            else:
+                logger.warning("LoRA adapter weights not found in checkpoint, using base model")
+        
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise
+    
+    def get_resume_checkpoint_path(self) -> str:
+        """Get the checkpoint path to resume from"""
+        if self.config.resume_from_checkpoint:
+            # Explicit checkpoint path provided
+            checkpoint_path = self.config.resume_from_checkpoint
+            if Path(checkpoint_path).exists():
+                logger.info(f"Using explicit checkpoint: {checkpoint_path}")
+                return checkpoint_path
+            else:
+                logger.warning(f"Explicit checkpoint not found: {checkpoint_path}")
+        
+        if self.config.auto_find_last_checkpoint:
+            # Auto-find last checkpoint
+            last_checkpoint = self.find_last_checkpoint(self.config.output_dir)
+            if last_checkpoint:
+                logger.info(f"Auto-found last checkpoint: {last_checkpoint}")
+                return last_checkpoint
+            else:
+                logger.info("No previous checkpoints found, starting fresh training")
+        
+        return None
+    
+    def list_checkpoints(self, output_dir: str = None) -> List[str]:
+        """List all available checkpoints in the output directory"""
+        if output_dir is None:
+            output_dir = self.config.output_dir
+            
+        output_path = Path(output_dir)
+        
+        if not output_path.exists():
+            return []
+        
+        checkpoints = []
+        for item in output_path.iterdir():
+            if item.is_dir() and item.name.startswith("checkpoint-"):
+                try:
+                    step_num = int(item.name.split("-")[1])
+                    # Verify it's a valid checkpoint
+                    if (item / "pytorch_model.bin").exists() or \
+                       (item / "model.safetensors").exists() or \
+                       (item / "adapter_model.bin").exists():
+                        checkpoints.append((step_num, str(item)))
+                except (ValueError, IndexError):
+                    continue
+        
+        # Sort by step number
+        checkpoints.sort(key=lambda x: x[0])
+        return [ckpt[1] for ckpt in checkpoints]
+    
+    def print_checkpoint_info(self):
+        """Print information about available checkpoints"""
+        checkpoints = self.list_checkpoints()
+        
+        if not checkpoints:
+            logger.info("No checkpoints found in output directory")
+            return
+        
+        logger.info(f"Found {len(checkpoints)} checkpoints:")
+        for i, ckpt_path in enumerate(checkpoints):
+            ckpt_name = Path(ckpt_path).name
+            step_num = ckpt_name.split("-")[1]
+            
+            # Check checkpoint size and modification time
+            try:
+                ckpt_stat = Path(ckpt_path).stat()
+                mod_time = ckpt_stat.st_mtime
+                from datetime import datetime
+                mod_time_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
+                
+                is_latest = (i == len(checkpoints) - 1)
+                status = " (LATEST)" if is_latest else ""
+                
+                logger.info(f"  {i+1:2d}. {ckpt_name} - Step {step_num} - {mod_time_str}{status}")
+            except:
+                logger.info(f"  {i+1:2d}. {ckpt_name} - Step {step_num}")
+        
+        # Show which one will be used for auto-resume
+        if self.config.auto_find_last_checkpoint:
+            latest = self.find_last_checkpoint(self.config.output_dir)
+            if latest:
+                logger.info(f"Auto-resume will use: {Path(latest).name}")
+        
+        return checkpoints
         
     def setup_datasets(self):
         """Setup training and validation datasets"""
@@ -692,6 +851,12 @@ class QwenVLLoRATrainer:
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Check for resume checkpoint
+        resume_checkpoint = self.get_resume_checkpoint_path()
+        
+        # Print checkpoint information
+        self.print_checkpoint_info()
+        
         # Save config
         config_dict = {
             "model_name": self.config.model_name,
@@ -702,6 +867,7 @@ class QwenVLLoRATrainer:
             "epochs": self.config.epochs,
             "batch_size": self.config.batch_size,
             "learning_rate": self.config.learning_rate,
+            "resume_from_checkpoint": resume_checkpoint,
         }
         
         with open(output_dir / "training_config.json", "w", encoding="utf-8") as f:
@@ -740,6 +906,8 @@ class QwenVLLoRATrainer:
             # Memory optimizations
             optim="adamw_torch",  # Official recommendation
             lr_scheduler_type="cosine",  # Better for fine-tuning
+            # Checkpoint settings
+            resume_from_checkpoint=resume_checkpoint,
         )
         
         # Create trainer with proper processor integration
@@ -756,12 +924,18 @@ class QwenVLLoRATrainer:
         logger.info(f"Training on {len(self.train_dataset)} samples")
         logger.info(f"Validation on {len(self.eval_dataset)} samples")
         
+        if resume_checkpoint:
+            logger.info(f"🔄 Resuming training from checkpoint: {resume_checkpoint}")
+        else:
+            logger.info("🆕 Starting fresh training")
+        
         # Verify gradients before training
         logger.info("Performing final gradient verification...")
         if not self.verify_gradients():
             raise RuntimeError("Gradient verification failed!")
         
-        trainer.train()
+        # Start training (will automatically resume from checkpoint if provided)
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
         
         # Save final model
         final_model_path = output_dir / "final_model"
@@ -789,6 +963,10 @@ def load_training_config(config_path: str = None) -> QwenVLTrainingConfig:
                     value = float(value)
                 elif key == 'frame_size' and isinstance(value, list):
                     value = tuple(value)
+                elif key in ['resume_from_checkpoint'] and value == "":
+                    value = None  # Handle empty strings as None
+                elif key in ['auto_find_last_checkpoint'] and isinstance(value, str):
+                    value = value.lower() in ['true', '1', 'yes', 'on']  # Convert string to bool
                 setattr(config, key, value)
         
         return config
@@ -807,6 +985,12 @@ def main():
     parser.add_argument("--batch-size", type=int, help="Batch size")
     parser.add_argument("--learning-rate", type=float, help="Learning rate")
     
+    # Checkpoint arguments
+    parser.add_argument("--resume-from-checkpoint", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument("--auto-find-checkpoint", action="store_true", help="Automatically find and resume from last checkpoint")
+    parser.add_argument("--no-auto-find-checkpoint", action="store_true", help="Disable automatic checkpoint detection")
+    parser.add_argument("--list-checkpoints", action="store_true", help="List available checkpoints and exit")
+    
     args = parser.parse_args()
     
     # Load configuration
@@ -824,6 +1008,29 @@ def main():
     if args.learning_rate:
         config.learning_rate = args.learning_rate
     
+    # Handle checkpoint arguments
+    if args.resume_from_checkpoint:
+        config.resume_from_checkpoint = args.resume_from_checkpoint
+        config.auto_find_last_checkpoint = False  # Disable auto-find when explicit path provided
+    elif args.auto_find_checkpoint:
+        config.auto_find_last_checkpoint = True
+    elif args.no_auto_find_checkpoint:
+        config.auto_find_last_checkpoint = False
+    
+    # Handle list checkpoints option
+    if args.list_checkpoints:
+        logger.info("Listing available checkpoints...")
+        try:
+            # Create a temporary trainer just to list checkpoints
+            trainer_obj = QwenVLLoRATrainer(config)
+            checkpoints = trainer_obj.print_checkpoint_info()
+            if not checkpoints:
+                logger.info("No checkpoints found in the output directory.")
+            return
+        except Exception as e:
+            logger.error(f"Failed to list checkpoints: {e}")
+            return
+    
     logger.info(f"Training configuration:")
     logger.info(f"  Dataset path: {config.dataset_path}")
     logger.info(f"  Output directory: {config.output_dir}")
@@ -831,6 +1038,8 @@ def main():
     logger.info(f"  Batch size: {config.batch_size}")
     logger.info(f"  Learning rate: {config.learning_rate}")
     logger.info(f"  LoRA r: {config.lora_r}")
+    logger.info(f"  Resume from checkpoint: {config.resume_from_checkpoint}")
+    logger.info(f"  Auto-find last checkpoint: {config.auto_find_last_checkpoint}")
     
     try:
         # Create trainer and start training
